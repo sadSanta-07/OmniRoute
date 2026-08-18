@@ -261,6 +261,45 @@ test.describe("modelsDevSync-extended", { concurrency: 1 }, async () => {
     assert.deepEqual(modelsDev.getModelsDevPricing(), {});
   });
 
+  test("getModelsDevPricing memoizes until save/clear (#9685)", async () => {
+    const modelsDev = await importFresh("pricing-memo");
+    const pricing = modelsDev.transformModelsDevToPricing(MOCK_MODELS_DEV_DATA);
+    modelsDev.saveModelsDevPricing(pricing);
+
+    const first = modelsDev.getModelsDevPricing();
+    const second = modelsDev.getModelsDevPricing();
+    assert.equal(first, second, "repeated reads must return the same memoized object");
+
+    // Mutating DB under the cache must not be visible until invalidation.
+    const db = core.getDbInstance();
+    db.prepare("DELETE FROM key_value WHERE namespace = 'models_dev_pricing'").run();
+    assert.equal(
+      modelsDev.getModelsDevPricing(),
+      first,
+      "raw SQL without save/clear must not bypass the memo"
+    );
+
+    modelsDev.clearModelsDevPricing();
+    assert.deepEqual(modelsDev.getModelsDevPricing(), {});
+
+    modelsDev.saveModelsDevPricing(pricing);
+    const afterSave = modelsDev.getModelsDevPricing();
+    assert.notEqual(afterSave, first, "save must invalidate the memo");
+    assert.equal(afterSave.openai["gpt-4o"].input, 2.5);
+
+    // Copilot review: DB reset must invalidate the memo so import/restore doesn't serve stale pricing.
+    const beforeReset = modelsDev.getModelsDevPricing();
+    core.resetDbInstance();
+    const afterReset = modelsDev.getModelsDevPricing();
+    assert.notEqual(
+      afterReset,
+      beforeReset,
+      "resetDbInstance must invalidate the memo (Copilot #10055)"
+    );
+    // Data is still on disk after resetDbInstance(), but the cache was cleared and re-read from fresh DB.
+    assert.equal(afterReset.openai["gpt-4o"].input, 2.5, "DB reset re-reads from fresh connection");
+  });
+
   test("modelsDev capabilities helpers create the table, persist rows, filter by provider/model, and expose context limits", async () => {
     const modelsDev = await importFresh("capabilities-storage");
     const capabilities = modelsDev.transformModelsDevToCapabilities(MOCK_MODELS_DEV_DATA);
@@ -671,7 +710,7 @@ test("the usual truthy spellings all start the sync, and nothing else does", asy
         // then never fetched anything; pin the fetch actually having run
         // for each truthy spelling, not just the first one.
         assert.ok(
-          await waitFor(() => modelsDev.getSyncStatus().lastSync !== null),
+          await waitFor(() => modelsDev.getSyncStatus().lastSync !== null, 2000),
           `MODELS_DEV_SYNC_ENABLED=${JSON.stringify(value)} should have completed a sync`
         );
       }
